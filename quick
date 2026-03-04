@@ -1,0 +1,103 @@
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+
+REM ============================================================
+REM WinPE Builder -> Writes bootable WinPE USB to E:
+REM Requires: Windows ADK (Deployment Tools) + WinPE add-on installed
+REM Run in: Deployment and Imaging Tools Environment (Admin)
+REM ============================================================
+
+set "TARGETUSB=E:"
+set "WORK=C:\WinPE"
+set "MOUNT=%WORK%\mount"
+
+REM WinPE Optional Components folder (amd64)
+set "OCROOT=%ProgramFiles(x86)%\Windows Kits\10\Assessment and Deployment Kit\Windows Preinstallation Environment\amd64\WinPE_OCs"
+
+echo.
+echo [1/7] Sanity checks...
+if not exist "%OCROOT%" (
+  echo ERROR: WinPE Optional Components not found:
+  echo        "%OCROOT%"
+  echo Install the WinPE add-on for the ADK.  & exit /b 1
+)
+
+echo WARNING: This will ERASE and format %TARGETUSB%
+echo If %TARGETUSB% is not your USB drive, STOP NOW.
+echo.
+
+REM ------------------------------------------------------------
+echo [2/7] Create WinPE working files at %WORK% ...
+if exist "%WORK%" (
+  echo Removing existing %WORK% ...
+  rmdir /s /q "%WORK%"
+)
+call copype amd64 "%WORK%"
+if errorlevel 1 exit /b 1
+
+REM ------------------------------------------------------------
+echo [3/7] Mount boot.wim ...
+mkdir "%MOUNT%" >nul 2>&1
+Dism /Mount-Image /ImageFile:"%WORK%\media\sources\boot.wim" /Index:1 /MountDir:"%MOUNT%"
+if errorlevel 1 exit /b 1
+
+REM ------------------------------------------------------------
+echo [4/7] Add Optional Components (PowerShell + Security + Storage/WMI) ...
+REM Microsoft notes OCs must match architecture/build and may have prerequisites/order. [2](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/winpe-add-packages--optional-components-reference?view=windows-11)
+REM Core chain commonly used for PowerShell + storage + imaging + secure startup:
+call :AddOC "WinPE-WMI.cab"
+call :AddOC "WinPE-StorageWMI.cab"
+call :AddOC "WinPE-Scripting.cab"
+call :AddOC "WinPE-NetFX.cab"
+call :AddOC "WinPE-PowerShell.cab"
+call :AddOC "WinPE-DismCmdlets.cab"
+call :AddOC "WinPE-SecureStartup.cab"
+
+REM If any add-package failed, bail out cleanly:
+if /i "%OCFAIL%"=="1" goto :FailUnmount
+
+REM ------------------------------------------------------------
+echo [5/7] Ensure startnet.cmd initializes WinPE (network + services init) ...
+REM Keep wpeinit at minimum; WinPE boot media guidance includes it in the startup sequence. [1](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/winpe-create-usb-bootable-drive?view=windows-11)
+(
+  echo wpeinit
+) > "%MOUNT%\Windows\System32\startnet.cmd"
+
+REM ------------------------------------------------------------
+echo [6/7] Commit + unmount image ...
+Dism /Unmount-Image /MountDir:"%MOUNT%" /Commit
+if errorlevel 1 exit /b 1
+
+REM ------------------------------------------------------------
+echo [7/7] Write bootable USB to %TARGETUSB% ...
+REM MakeWinPEMedia creates bootable WinPE USB drives from the working set. [1](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/winpe-create-usb-bootable-drive?view=windows-11)
+MakeWinPEMedia /UFD "%WORK%" %TARGETUSB%
+if errorlevel 1 exit /b 1
+
+echo.
+echo DONE: WinPE USB created on %TARGETUSB%
+exit /b 0
+
+REM =========================
+REM Functions
+REM =========================
+:AddOC
+set "OC=%~1"
+if not exist "%OCROOT%\%OC%" (
+  echo ERROR: Missing OC: "%OCROOT%\%OC%"
+  set "OCFAIL=1"
+  exit /b 0
+)
+echo   + %OC%
+Dism /Add-Package /Image:"%MOUNT%" /PackagePath:"%OCROOT%\%OC%"
+if errorlevel 1 (
+  echo ERROR adding %OC%
+  set "OCFAIL=1"
+)
+exit /b 0
+
+:FailUnmount
+echo.
+echo ERROR: Optional Component install failed. Attempting to discard mount...
+Dism /Unmount-Image /MountDir:"%MOUNT%" /Discard
+exit /b 1
